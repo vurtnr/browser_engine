@@ -1,0 +1,15 @@
+2026/02/25-09:19:56.554 98c569 Reusing MANIFEST /Users/jiaoyumin/workspace/browser_engine/1688_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/02/25-09:19:56.557 98c569 Recovering log #112
+2026/02/25-09:19:56.557 98c569 Reusing old log /Users/jiaoyumin/workspace/browser_engine/1688_profile/Default/Local Storage/leveldb/000112.log 
+2026/02/25-09:20:11.874 98c56c Level-0 table #116: started
+2026/02/25-09:20:11.887 98c56c Level-0 table #116: 30883 bytes OK
+2026/02/25-09:20:11.893 98c56c Delete type=0 #112
+2026/02/25-09:20:11.894 98c56c Compacting 4@0 + 1@1 files
+2026/02/25-09:20:11.917 98c56c Generated table #117@0: 159 keys, 1287960 bytes
+2026/02/25-09:20:11.917 98c56c Compacted 4@0 + 1@1 files => 1287960 bytes
+2026/02/25-09:20:11.919 98c56c compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/02/25-09:20:11.920 98c56c Delete type=2 #116
+2026/02/25-09:20:11.920 98c56c Delete type=2 #111
+2026/02/25-09:20:11.920 98c56c Delete type=2 #113
+2026/02/25-09:20:11.920 98c56c Delete type=2 #106
+2026/02/25-09:20:11.920 98c56c Delete type=2 #108

@@ -1,0 +1,6 @@
+2026/02/25-11:17:19.517 9d8870 Reusing MANIFEST /Users/jiaoyumin/workspace/browser_engine/1688_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/02/25-11:17:19.529 9d8870 Recovering log #115
+2026/02/25-11:17:19.530 9d8870 Reusing old log /Users/jiaoyumin/workspace/browser_engine/1688_profile/Default/Local Storage/leveldb/000115.log 
+2026/02/25-11:17:25.293 9d8873 Level-0 table #120: started
+2026/02/25-11:17:25.304 9d8873 Level-0 table #120: 25137 bytes OK
+2026/02/25-11:17:25.314 9d8873 Delete type=0 #115
