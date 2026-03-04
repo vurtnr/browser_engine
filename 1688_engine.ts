@@ -13,6 +13,277 @@ export interface SearchResult {
   cosScore: number;
 }
 
+interface RectBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+interface CropPoint {
+  x: number;
+  y: number;
+}
+
+interface CursorProbePoint extends CropPoint {
+  cursor: string;
+}
+
+type CursorProbeMode = "move" | "resize";
+
+interface FullCanvasCropPlan {
+  moveStart: CropPoint;
+  moveEnd: CropPoint;
+  resizeStart: CropPoint;
+  resizeEnd: CropPoint;
+}
+
+const CROP_EDGE_PADDING = 6;
+const DEFAULT_RESULT_LIMIT = 36;
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeCursor(cursor: string): string {
+  return (cursor || "").trim().toLowerCase();
+}
+
+function isMoveCursor(cursor: string): boolean {
+  const value = normalizeCursor(cursor);
+  return value === "move" || value.includes("grab") || value.includes("grabbing");
+}
+
+function isResizeCursor(cursor: string): boolean {
+  const value = normalizeCursor(cursor);
+  return value.includes("resize") || value.includes("nwse") || value.includes("nesw") || value.includes("ew-resize") || value.includes("ns-resize");
+}
+
+function matchesCursorMode(cursor: string, mode: CursorProbeMode): boolean {
+  return mode === "move" ? isMoveCursor(cursor) : isResizeCursor(cursor);
+}
+
+export function pickBestCursorProbePoint(
+  probes: CursorProbePoint[],
+  mode: CursorProbeMode,
+  canvasRect: RectBox,
+): CropPoint | null {
+  const candidates = probes.filter((probe) => mode === "move" ? isMoveCursor(probe.cursor) : isResizeCursor(probe.cursor));
+  if (candidates.length === 0) return null;
+
+  if (mode === "move") {
+    const center = {
+      x: canvasRect.left + canvasRect.width / 2,
+      y: canvasRect.top + canvasRect.height / 2,
+    };
+    const best = candidates.reduce((best, point) => {
+      const currentDistance = Math.hypot(point.x - center.x, point.y - center.y);
+      const bestDistance = Math.hypot(best.x - center.x, best.y - center.y);
+      return currentDistance < bestDistance ? point : best;
+    });
+    return { x: best.x, y: best.y };
+  }
+
+  const best = candidates.reduce((best, point) => {
+    const currentScore = point.x + point.y;
+    const bestScore = best.x + best.y;
+    return currentScore > bestScore ? point : best;
+  });
+  return { x: best.x, y: best.y };
+}
+
+export function deriveCursorBounds(probes: CursorProbePoint[], mode: CursorProbeMode): RectBox | null {
+  const candidates = probes.filter((probe) => matchesCursorMode(probe.cursor, mode));
+  if (candidates.length === 0) return null;
+
+  let left = candidates[0].x;
+  let top = candidates[0].y;
+  let right = candidates[0].x;
+  let bottom = candidates[0].y;
+
+  for (const point of candidates) {
+    if (point.x < left) left = point.x;
+    if (point.y < top) top = point.y;
+    if (point.x > right) right = point.x;
+    if (point.y > bottom) bottom = point.y;
+  }
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+export function pickResizeStartFromBounds(
+  moveBounds: RectBox,
+  canvasRect: RectBox,
+  offset: number = 4,
+): CropPoint {
+  return {
+    x: clamp(moveBounds.right + offset, canvasRect.left + CROP_EDGE_PADDING, canvasRect.right - CROP_EDGE_PADDING),
+    y: clamp(moveBounds.bottom + offset, canvasRect.top + CROP_EDGE_PADDING, canvasRect.bottom - CROP_EDGE_PADDING),
+  };
+}
+
+export function isLikelyCropCanvasRect(canvasRect: RectBox): boolean {
+  if (canvasRect.width < 220 || canvasRect.height < 220) return false;
+  const ratio = canvasRect.width / canvasRect.height;
+  return ratio > 0.75 && ratio < 1.35;
+}
+
+export function evaluateResizeCoverage(
+  beforeResizeBounds: RectBox | null,
+  afterResizeBounds: RectBox | null,
+  canvasRect: RectBox,
+): {
+  ok: boolean;
+  reason: string;
+  metrics: {
+    growthX: number;
+    growthY: number;
+    coverageX: number;
+    coverageY: number;
+    rightGap: number;
+    bottomGap: number;
+  };
+} {
+  if (!beforeResizeBounds || !afterResizeBounds) {
+    return {
+      ok: false,
+      reason: "missing-bounds",
+      metrics: { growthX: 0, growthY: 0, coverageX: 0, coverageY: 0, rightGap: -1, bottomGap: -1 },
+    };
+  }
+
+  const growthX = afterResizeBounds.width / Math.max(beforeResizeBounds.width, 1);
+  const growthY = afterResizeBounds.height / Math.max(beforeResizeBounds.height, 1);
+  const coverageX = afterResizeBounds.width / Math.max(canvasRect.width, 1);
+  const coverageY = afterResizeBounds.height / Math.max(canvasRect.height, 1);
+  const rightGap = canvasRect.right - afterResizeBounds.right;
+  const bottomGap = canvasRect.bottom - afterResizeBounds.bottom;
+
+  const failed: string[] = [];
+  if (coverageX < 0.78) failed.push("coverageX");
+  if (coverageY < 0.78) failed.push("coverageY");
+  if (rightGap > 28) failed.push("rightGap");
+  if (bottomGap > 28) failed.push("bottomGap");
+
+  return {
+    ok: failed.length === 0,
+    reason: failed.length === 0 ? "ok" : failed.join("+"),
+    metrics: { growthX, growthY, coverageX, coverageY, rightGap, bottomGap },
+  };
+}
+
+export function buildResizeHandleCandidates(
+  moveBounds: RectBox,
+  canvasRect: RectBox,
+  span: number = 8,
+  step: number = 4,
+): CropPoint[] {
+  const points: CropPoint[] = [];
+  const seen = new Set<string>();
+  const clampIntoCanvas = (point: CropPoint): CropPoint => ({
+    x: clamp(point.x, canvasRect.left + CROP_EDGE_PADDING, canvasRect.right - CROP_EDGE_PADDING),
+    y: clamp(point.y, canvasRect.top + CROP_EDGE_PADDING, canvasRect.bottom - CROP_EDGE_PADDING),
+  });
+
+  const push = (point: CropPoint): void => {
+    const clamped = clampIntoCanvas(point);
+    const key = `${clamped.x}:${clamped.y}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    points.push(clamped);
+  };
+
+  // Always try the geometric bottom-right corner first.
+  push({ x: Math.round(moveBounds.right), y: Math.round(moveBounds.bottom) });
+
+  for (let dx = -span; dx <= span; dx += step) {
+    for (let dy = -span; dy <= span; dy += step) {
+      if (dx === 0 && dy === 0) continue;
+      push({
+        x: Math.round(moveBounds.right + dx),
+        y: Math.round(moveBounds.bottom + dy),
+      });
+    }
+  }
+
+  return points;
+}
+
+function clampPointInCanvas(point: CropPoint, canvasRect: RectBox, edgePadding: number): CropPoint {
+  return {
+    x: clamp(point.x, canvasRect.left + edgePadding, canvasRect.right - edgePadding),
+    y: clamp(point.y, canvasRect.top + edgePadding, canvasRect.bottom - edgePadding),
+  };
+}
+
+export function buildFullCanvasCropPlan(
+  selectionRect: RectBox,
+  canvasRect: RectBox,
+  edgePadding: number = CROP_EDGE_PADDING,
+): FullCanvasCropPlan {
+  const centerOffsetX = selectionRect.width / 2;
+  const centerOffsetY = selectionRect.height / 2;
+  const moveStart = clampPointInCanvas(
+    {
+      x: selectionRect.left + centerOffsetX,
+      y: selectionRect.top + centerOffsetY,
+    },
+    canvasRect,
+    edgePadding,
+  );
+
+  const moveEnd = {
+    x: canvasRect.left + edgePadding + centerOffsetX,
+    y: canvasRect.top + edgePadding + centerOffsetY,
+  };
+
+  const resizeStart = clampPointInCanvas(
+    {
+      x: selectionRect.right - 4,
+      y: selectionRect.bottom - 4,
+    },
+    canvasRect,
+    edgePadding,
+  );
+
+  const resizeEnd = {
+    x: canvasRect.right - edgePadding,
+    y: canvasRect.bottom - edgePadding,
+  };
+
+  return { moveStart, moveEnd, resizeStart, resizeEnd };
+}
+
+export function limitSearchResults(results: SearchResult[], limit: number = DEFAULT_RESULT_LIMIT): SearchResult[] {
+  return results.slice(0, limit);
+}
+
+export function assemblePriceFromFragments(
+  majorFragment: string,
+  minorFragment: string,
+  fallbackText: string,
+): string {
+  const normalize = (value: string): string => (value || "").replace(/\s+/g, "");
+  const extractNumeric = (value: string): string => {
+    const cleaned = normalize(value).replace(/[^\d.]/g, "");
+    const matched = cleaned.match(/\d+(?:\.\d+)?/);
+    return matched ? matched[0] : "";
+  };
+
+  const merged = extractNumeric(`${normalize(majorFragment)}${normalize(minorFragment)}`);
+  if (merged) return merged;
+  return extractNumeric(fallbackText);
+}
+
 export async function search1688ByImage(
   browser: Browser,
   page: Page,
@@ -47,8 +318,20 @@ export async function search1688ByImage(
       const parsedItems = cards.map((card) => {
         const titleEl = card.querySelector('div[class*="titleText"]');
         const title = titleEl ? titleEl.innerText.trim() : "";
-        const priceEl = card.querySelector('div[class*="textMain"]');
-        const price = priceEl ? priceEl.innerText.trim() : "";
+        const priceContainer = card.querySelector('div[class*="priceItem"]');
+        let priceMajor = "";
+        let priceMinor = "";
+        if (priceContainer instanceof HTMLElement) {
+          const priceNodes = Array.from(priceContainer.querySelectorAll(":scope > div"));
+          const yuanIndex = priceNodes.findIndex((node) => (node.textContent || "").replace(/\s+/g, "") === "¥");
+          if (yuanIndex >= 0) {
+            priceMajor = (priceNodes[yuanIndex + 1]?.textContent || "").trim();
+            priceMinor = (priceNodes[yuanIndex + 2]?.textContent || "").trim();
+          }
+        }
+
+        const legacyPriceEl = card.querySelector('div[class*="textMain"]');
+        const legacyPriceText = legacyPriceEl ? legacyPriceEl.textContent?.trim() || "" : "";
         const shopEl = card.querySelector('div[class*="shopName"]');
         const shopName = shopEl ? shopEl.innerText.trim() : "";
         const imgEl = card.querySelector('img[class*="mainImg"]');
@@ -72,7 +355,7 @@ export async function search1688ByImage(
           const match = reportData.match(/object_id@(\d+)/);
           if (match && match[1]) itemUrl = `https://detail.1688.com/offer/${match[1]}.html`;
         }
-        return { title, price: price ? `¥${price}` : "暂无", sales: "", moq: "", shopName, itemUrl, imageUrl, isAd, cosScore };
+        return { title, priceMajor, priceMinor, legacyPriceText, sales: "", moq: "", shopName, itemUrl, imageUrl, isAd, cosScore };
       });
 
       const isScoreValid = parsedItems.filter((item) => item.cosScore > 0).length > 0;
@@ -87,9 +370,23 @@ export async function search1688ByImage(
       });
     }, targetKeywords);
 
-    // 🌟 核心需求满足：强制根据 1688 算法给出的 cosScore 相似度进行降序排序
-    rawData.sort((a, b) => b.cosScore - a.cosScore);
-    return rawData;
+    const normalizedData: SearchResult[] = rawData.map((item) => {
+      const priceValue = assemblePriceFromFragments(item.priceMajor, item.priceMinor, item.legacyPriceText);
+      return {
+        title: item.title,
+        price: priceValue ? `¥${priceValue}` : "暂无",
+        sales: item.sales,
+        moq: item.moq,
+        shopName: item.shopName,
+        itemUrl: item.itemUrl,
+        imageUrl: item.imageUrl,
+        isAd: item.isAd,
+        cosScore: item.cosScore,
+      };
+    });
+
+    // 保持页面原始排序并只取前 36 个结果回传 Rust
+    return limitSearchResults(normalizedData);
   };
 
   try {
@@ -172,6 +469,170 @@ export async function search1688ByImage(
     } else {
         console.log("📐 [第二重爆破] 启动机械臂拖动 Canvas 拉满全图...");
         try {
+            const dragMouse = async (start: CropPoint, end: CropPoint, steps: number = 28): Promise<void> => {
+              await resultPage!.mouse.move(start.x, start.y);
+              await resultPage!.mouse.down();
+              await resultPage!.mouse.move(end.x, end.y, { steps });
+              await new Promise((r) => setTimeout(r, 200));
+              await resultPage!.mouse.up();
+            };
+
+            const getCroperCanvasRect = async (): Promise<RectBox | null> => {
+              const canvasHandle = await resultPage!.$("#croper-canvas");
+              if (!canvasHandle) return null;
+              const box = await canvasHandle.boundingBox();
+              if (!box || box.width < 50 || box.height < 50) return null;
+              const rect = {
+                left: box.x,
+                top: box.y,
+                right: box.x + box.width,
+                bottom: box.y + box.height,
+                width: box.width,
+                height: box.height,
+              };
+              return isLikelyCropCanvasRect(rect) ? rect : null;
+            };
+
+            const readCursorAtPoint = async (point: CropPoint): Promise<string> => {
+              return await resultPage!.evaluate((payload) => {
+                const { x, y } = payload;
+                const canvas = document.querySelector("#croper-canvas");
+                const hit = document.elementFromPoint(x, y);
+                const picks: string[] = [];
+
+                if (hit instanceof HTMLElement) {
+                  picks.push(window.getComputedStyle(hit).cursor || hit.style.cursor || "");
+                }
+                if (canvas instanceof HTMLElement) {
+                  picks.push(window.getComputedStyle(canvas).cursor || canvas.style.cursor || "");
+                }
+                if (document.body instanceof HTMLElement) {
+                  picks.push(window.getComputedStyle(document.body).cursor || document.body.style.cursor || "");
+                }
+
+                const normalized = picks.map((cursor) => (cursor || "").toLowerCase().trim());
+                const preferred = normalized.find((cursor) => cursor.length > 0 && cursor !== "default" && cursor !== "auto");
+                return preferred || normalized[0] || "";
+              }, point);
+            };
+
+            const scanCanvasCursorPoints = async (
+              canvasRect: RectBox,
+              rows: number,
+              cols: number,
+              edgePadding: number = 8,
+            ): Promise<CursorProbePoint[]> => {
+              const points: CursorProbePoint[] = [];
+              const minX = canvasRect.left + edgePadding;
+              const maxX = canvasRect.right - edgePadding;
+              const minY = canvasRect.top + edgePadding;
+              const maxY = canvasRect.bottom - edgePadding;
+
+              for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                  const x = cols === 1 ? (minX + maxX) / 2 : minX + (maxX - minX) * (c / (cols - 1));
+                  const y = rows === 1 ? (minY + maxY) / 2 : minY + (maxY - minY) * (r / (rows - 1));
+                  const point = { x: Math.round(x), y: Math.round(y) };
+                  await resultPage!.mouse.move(point.x, point.y);
+                  await new Promise((rsv) => setTimeout(rsv, 12));
+                  const cursor = await readCursorAtPoint(point);
+                  points.push({ ...point, cursor });
+                }
+              }
+              return points;
+            };
+
+            const findCursorProbe = async (
+              mode: CursorProbeMode,
+              canvasRect: RectBox,
+              passes: Array<{ rows: number; cols: number; edgePadding: number }> = [
+                { rows: 7, cols: 7, edgePadding: 10 },
+                { rows: 13, cols: 13, edgePadding: 6 },
+              ],
+            ): Promise<{ point: CropPoint | null; probes: CursorProbePoint[] }> => {
+              const allProbes: CursorProbePoint[] = [];
+              for (const pass of passes) {
+                const probes = await scanCanvasCursorPoints(canvasRect, pass.rows, pass.cols, pass.edgePadding);
+                allProbes.push(...probes);
+                const picked = pickBestCursorProbePoint(allProbes, mode, canvasRect);
+                if (picked) {
+                  return { point: picked, probes: allProbes };
+                }
+              }
+              return { point: null, probes: allProbes };
+            };
+
+            const moveBoundsProbePasses: Array<{ rows: number; cols: number; edgePadding: number }> = [
+              { rows: 15, cols: 15, edgePadding: 4 },
+              { rows: 21, cols: 21, edgePadding: 3 },
+            ];
+
+            const searchCursorAroundPoint = async (
+              center: CropPoint,
+              mode: CursorProbeMode,
+              canvasRect: RectBox,
+              radius: number = 30,
+              step: number = 4,
+            ): Promise<CropPoint | null> => {
+              const points: CropPoint[] = [];
+              for (let dx = -radius; dx <= radius; dx += step) {
+                for (let dy = -radius; dy <= radius; dy += step) {
+                  points.push({
+                    x: clamp(Math.round(center.x + dx), canvasRect.left + CROP_EDGE_PADDING, canvasRect.right - CROP_EDGE_PADDING),
+                    y: clamp(Math.round(center.y + dy), canvasRect.top + CROP_EDGE_PADDING, canvasRect.bottom - CROP_EDGE_PADDING),
+                  });
+                }
+              }
+
+              points.sort((a, b) => {
+                const da = Math.hypot(a.x - center.x, a.y - center.y);
+                const db = Math.hypot(b.x - center.x, b.y - center.y);
+                return da - db;
+              });
+
+              for (const point of points) {
+                await resultPage!.mouse.move(point.x, point.y);
+                await new Promise((rsv) => setTimeout(rsv, 10));
+                const cursor = await readCursorAtPoint(point);
+                if (matchesCursorMode(cursor, mode)) return point;
+              }
+
+              return null;
+            };
+
+            const formatProbeSummary = (probes: CursorProbePoint[]): string => {
+              return probes
+                .filter((item) => item.cursor.length > 0)
+                .slice(0, 24)
+                .map((item) => `${item.cursor}@(${item.x},${item.y})`)
+                .join(", ");
+            };
+
+            const ensureCropDialogReady = async (timeoutMs: number = 20000): Promise<RectBox> => {
+              const startedAt = Date.now();
+              while (Date.now() - startedAt < timeoutMs) {
+                const rect = await getCroperCanvasRect();
+                if (rect) {
+                  const isModalReady = await resultPage!.evaluate((payload) => {
+                    const canvas = document.querySelector("#croper-canvas");
+                    if (!(canvas instanceof HTMLElement)) return false;
+                    const centerX = Math.round(payload.left + payload.width / 2);
+                    const centerY = Math.round(payload.top + payload.height / 2);
+                    const hit = document.elementFromPoint(centerX, centerY);
+                    const hitOnCanvas = hit === canvas || (hit instanceof Node && canvas.contains(hit));
+                    const confirmBtn = Array.from(document.querySelectorAll("button, div, span"))
+                      .find((el) => (el.textContent || "").trim() === "确认");
+                    const cancelBtn = Array.from(document.querySelectorAll("button, div, span"))
+                      .find((el) => (el.textContent || "").trim() === "取消");
+                    return !!confirmBtn && !!cancelBtn && hitOnCanvas;
+                  }, rect);
+                  if (isModalReady) return rect;
+                }
+                await new Promise((r) => setTimeout(r, 250));
+              }
+              throw new Error("[FULL_CROP_NOT_APPLIED] 裁剪弹窗未进入可操作状态（可能误命中缩略图画布）");
+            };
+
             // 🌟 1. 强制死等裁剪按钮出现，最长等 15 秒，避免页面未渲染完毕就开始点
             console.log("⏳ 等待裁剪面板出现...");
             await resultPage.waitForFunction(() => {
@@ -190,39 +651,129 @@ export async function search1688ByImage(
               }
             });
 
-            // 🌟 2. 强制死等 Canvas 画布渲染
-            const canvasHandle = await resultPage.waitForSelector('div[role="dialog"] canvas', { visible: true, timeout: 10000 })
-              .catch(async () => await resultPage!.waitForSelector("canvas", { visible: true, timeout: 10000 }));
-            
-            if (!canvasHandle) throw new Error("Canvas 画布未在规定时间内渲染！");
+            // 🌟 2. 等待裁剪弹窗与白色选择框稳定出现
+            await resultPage.waitForSelector("#croper-canvas", { visible: true, timeout: 20000 }).catch(() => {});
             await new Promise((r) => setTimeout(r, 1500));
+            const canvasRect = await ensureCropDialogReady(20000);
 
-            const canvasBox = await canvasHandle.boundingBox();
-            if (canvasBox && canvasBox.width > 50) {
-              // 绝对坐标系：直接对角线拉满
-              const startX = canvasBox.x + 5; const startY = canvasBox.y + 5;
-              const endX = canvasBox.x + canvasBox.width - 5; const endY = canvasBox.y + canvasBox.height - 5;
-
-              // 仿生拖拽：增加 steps 让鼠标平滑移动，避开行为特征检测
-              await resultPage.mouse.move(startX, startY); await resultPage.mouse.down();
-              await resultPage.mouse.move(endX, endY, { steps: 30 }); 
-              await new Promise((r) => setTimeout(r, 300)); await resultPage.mouse.up();
-              await new Promise((r) => setTimeout(r, 500));
-
-              await resultPage.evaluate(() => {
-                const confirmBtn = Array.from(document.querySelectorAll("button, div, span")).find((el) => el.innerText && el.innerText.trim() === "确认");
-                if (confirmBtn) confirmBtn.click();
-              });
-              
-              console.log("✅ 全图覆盖重绘完成！已提交，等待最新数据刷新...");
-              await resultPage.waitForNetworkIdle({ timeout: 15000 }).catch(() => {});
-              await resultPage.waitForSelector('div[class*="searchOfferWrapper"]', { timeout: 15000 }).catch(() => {});
+            const moveProbe = await findCursorProbe("move", canvasRect);
+            if (!moveProbe.point) {
+              const probeSummary = moveProbe.probes
+                .filter((item) => item.cursor.length > 0)
+                .slice(0, 20)
+                .map((item) => `${item.cursor}@(${item.x},${item.y})`)
+                .join(", ");
+              throw new Error(`未探测到可拖拽 move 光标点，样本=${probeSummary || "none"}`);
             }
+
+            const moveTarget = {
+              x: canvasRect.left + 26,
+              y: canvasRect.top + 26,
+            };
+
+            console.log("📐 步骤 1/2：探测 move 光标后，拖拽选框到左上角...");
+            await dragMouse(moveProbe.point, moveTarget, 24);
+            await new Promise((r) => setTimeout(r, 450));
+
+            const beforeResizeProbe = await findCursorProbe("move", canvasRect, moveBoundsProbePasses);
+            let moveBoundsBeforeResize = deriveCursorBounds(beforeResizeProbe.probes, "move");
+            if (!moveBoundsBeforeResize) {
+              throw new Error(`[FULL_CROP_NOT_APPLIED] 第一步移动后无法识别选框范围，样本=${formatProbeSummary(beforeResizeProbe.probes) || "none"}`);
+            }
+            console.log("🧭 move_bounds_before_resize:", moveBoundsBeforeResize);
+
+            const resizeTarget = {
+              x: canvasRect.right - CROP_EDGE_PADDING,
+              y: canvasRect.bottom - CROP_EDGE_PADDING,
+            };
+
+            let coverage = evaluateResizeCoverage(moveBoundsBeforeResize, moveBoundsBeforeResize, canvasRect);
+            let moveBoundsAfterResize: RectBox | null = null;
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              const handleCandidates = buildResizeHandleCandidates(moveBoundsBeforeResize, canvasRect, 10, 3);
+              let resizeStart: CropPoint | null = null;
+              for (const candidate of handleCandidates) {
+                const cursor = await readCursorAtPoint(candidate);
+                if (isResizeCursor(cursor)) {
+                  resizeStart = candidate;
+                  break;
+                }
+              }
+
+              if (!resizeStart) {
+                const fallbackStart = pickResizeStartFromBounds(moveBoundsBeforeResize, canvasRect);
+                resizeStart = await searchCursorAroundPoint(fallbackStart, "resize", canvasRect, 42, 3);
+              }
+
+              if (!resizeStart) {
+                throw new Error(`[FULL_CROP_NOT_APPLIED] 第${attempt}次拉伸前未定位到 resize 控制点`);
+              }
+
+              console.log(`📐 步骤 2/2（第${attempt}次）：从`, resizeStart, "拉伸到", resizeTarget);
+              await dragMouse(resizeStart, resizeTarget, attempt === 1 ? 30 : 26);
+              await new Promise((r) => setTimeout(r, 380));
+
+              const afterResizeMoveProbe = await findCursorProbe("move", canvasRect, moveBoundsProbePasses);
+              moveBoundsAfterResize = deriveCursorBounds(afterResizeMoveProbe.probes, "move");
+              console.log(`🧭 move_bounds_after_resize_attempt_${attempt}:`, moveBoundsAfterResize);
+
+              coverage = evaluateResizeCoverage(moveBoundsBeforeResize, moveBoundsAfterResize, canvasRect);
+              console.log(`🧭 coverage_ratio_attempt_${attempt}:`, coverage.metrics, "result:", coverage.reason);
+
+              if (coverage.ok) break;
+
+              // Coverage still fails: reset the box to top-left and retry a different handle start.
+              if (attempt < 3) {
+                const resetMoveProbe = await findCursorProbe("move", canvasRect, moveBoundsProbePasses);
+                if (!resetMoveProbe.point) {
+                  throw new Error(`[FULL_CROP_NOT_APPLIED] 第${attempt}次拉伸失败后无法重置选框，coverage=${coverage.reason}`);
+                }
+                await dragMouse(resetMoveProbe.point, moveTarget, 22);
+                await new Promise((r) => setTimeout(r, 280));
+
+                const resetBoundsProbe = await findCursorProbe("move", canvasRect, moveBoundsProbePasses);
+                const resetBounds = deriveCursorBounds(resetBoundsProbe.probes, "move");
+                if (!resetBounds) {
+                  throw new Error(`[FULL_CROP_NOT_APPLIED] 第${attempt}次拉伸后重置失败，无法识别选框范围`);
+                }
+                moveBoundsBeforeResize = resetBounds;
+                console.log(`🧭 move_bounds_before_resize_retry_${attempt}:`, moveBoundsBeforeResize);
+              }
+            }
+
+            if (!coverage.ok) {
+              throw new Error(`[FULL_CROP_NOT_APPLIED] 拉伸覆盖校验失败：${coverage.reason} metrics=${JSON.stringify(coverage.metrics)}`);
+            }
+
+            await resultPage.evaluate(() => {
+              const visibleDialogs = Array.from(document.querySelectorAll('div[role="dialog"], div[class*="dialog"]'))
+                .filter((node) => {
+                  if (!(node instanceof HTMLElement)) return false;
+                  const style = window.getComputedStyle(node);
+                  const rect = node.getBoundingClientRect();
+                  return style.display !== "none" && style.visibility !== "hidden" && rect.width > 50 && rect.height > 50;
+                });
+              const targetDialog = visibleDialogs.find((dialog) => dialog.querySelector("canvas")) || visibleDialogs[0];
+              const scope = targetDialog || document;
+              const confirmBtn = Array.from(scope.querySelectorAll("button, div, span")).find((el) => el.textContent?.trim() === "确认");
+              if (confirmBtn instanceof HTMLElement) {
+                confirmBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                confirmBtn.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                confirmBtn.click();
+              }
+            });
+            
+            console.log("✅ 全图覆盖重绘完成！已提交，等待最新数据刷新...");
+            await resultPage.waitForNetworkIdle({ timeout: 15000 }).catch(() => {});
+            await resultPage.waitForSelector('div[class*="searchOfferWrapper"]', { timeout: 15000 }).catch(() => {});
         } catch(e) {
-            // 如果真的遇到页面大改版等不可抗力，报错打印出来，但不要让整个程序直接崩死
+            const message = e instanceof Error ? e.message : String(e);
             console.error("❌ 强制重绘操作受阻，1688 页面可能未响应:", e);
+            if (message.includes("[FULL_CROP_NOT_APPLIED]")) throw e;
+            throw new Error(`[FULL_CROP_NOT_APPLIED] ${message}`);
         }
-        return await scrapeCurrentPage(); 
+        return await scrapeCurrentPage();
     }
 
   } catch (error) {
